@@ -6,6 +6,7 @@ use clap::Parser;
 use color_eyre::eyre::{Context, eyre};
 use fast_socks5::Socks5Command;
 use fast_socks5::server::{Socks5ServerProtocol, transfer};
+use rand::seq::IndexedRandom;
 use russh::client;
 use russh::keys::{key::PrivateKeyWithHashAlg, load_secret_key};
 use tokio::net::TcpListener;
@@ -45,79 +46,80 @@ async fn main() -> color_eyre::Result<()> {
         &std::fs::read(cli.config).wrap_err_with(|| "Couldn't find configuration")?,
     )
     .wrap_err_with(|| "Invalid configuration")?;
-    let key = Arc::new(
-        load_secret_key(&config.accounts[0].private_key_path, None)
-            .wrap_err_with(|| "Missing secret key file")?,
-    );
+    let mut sessions = vec![];
+    for account in config.accounts {
+        let key = Arc::new(
+            load_secret_key(&account.private_key_path, None)
+                .wrap_err_with(|| "Missing secret key file")?,
+        );
 
-    // Create Sandhole client
-    let ssh_client = SshClient;
-    let mut session = client::connect(
-        Default::default(),
-        (
-            config.accounts[0].reverse_proxies[0].host.as_str(),
-            config.accounts[0].reverse_proxies[0].port,
-        ),
-        ssh_client,
-    )
-    .await
-    .wrap_err_with(|| "Failed to connect to SSH server")?;
-    if !session
-        .authenticate_publickey(
-            "sandproxy",
-            PrivateKeyWithHashAlg::new(
-                Arc::clone(&key),
-                session
-                    .best_supported_rsa_hash()
-                    .await
-                    .wrap_err_with(|| "Failed to get best supported RSA hash")?
-                    .flatten(),
-            ),
-        )
-        .await
-        .wrap_err_with(|| "SSH authentication failed")?
-        .success()
-    {
-        return Err(eyre!("Sandhole authentication failed"));
-    }
-    let channel = session
-        .channel_open_direct_tcpip(
-            &config.accounts[0].reverse_proxies[0].proxies[0].alias.0,
-            config.accounts[0].reverse_proxies[0].proxies[0]
-                .alias
-                .1
-                .into(),
-            "::1",
-            12345,
-        )
-        .await
-        .wrap_err_with(|| "Local forwarding failed")?;
-    let socket = channel.into_stream();
+        // Create Sandhole clients
+        for reverse_proxy in account.reverse_proxies {
+            let ssh_client = SshClient;
+            let mut session = client::connect(
+                Default::default(),
+                (reverse_proxy.host.as_str(), reverse_proxy.port),
+                ssh_client,
+            )
+            .await
+            .wrap_err_with(|| "Failed to connect to SSH server")?;
+            if !session
+                .authenticate_publickey(
+                    "sandproxy",
+                    PrivateKeyWithHashAlg::new(
+                        Arc::clone(&key),
+                        session
+                            .best_supported_rsa_hash()
+                            .await
+                            .wrap_err_with(|| "Failed to get best supported RSA hash")?
+                            .flatten(),
+                    ),
+                )
+                .await
+                .wrap_err_with(|| "SSH authentication failed")?
+                .success()
+            {
+                return Err(eyre!("Sandhole authentication failed"));
+            }
 
-    // Create proxy client
-    let proxy_client = ProxyClient;
-    let mut proxy_session = client::connect_stream(Default::default(), socket, proxy_client)
-        .await
-        .wrap_err_with(|| "Failed to connect to proxied SSH server")?;
-    if !proxy_session
-        .authenticate_publickey(
-            &config.accounts[0].reverse_proxies[0].proxies[0].user,
-            PrivateKeyWithHashAlg::new(
-                Arc::clone(&key),
-                proxy_session
-                    .best_supported_rsa_hash()
+            // Create proxy clients
+            for proxy in reverse_proxy.proxies {
+                let channel = session
+                    .channel_open_direct_tcpip(&proxy.alias.0, proxy.alias.1.into(), "::1", 12345)
                     .await
-                    .wrap_err_with(|| "Failed to get best supported RSA hash")?
-                    .flatten(),
-            ),
-        )
-        .await
-        .wrap_err_with(|| "SSH authentication failed")?
-        .success()
-    {
-        return Err(eyre!("Proxy authentication failed"));
+                    .wrap_err_with(|| "Local forwarding failed")?;
+                let socket = channel.into_stream();
+                let proxy_client = SshClient;
+                let mut proxy_session =
+                    client::connect_stream(Default::default(), socket, proxy_client)
+                        .await
+                        .wrap_err_with(|| "Failed to connect to proxied SSH server")?;
+                if !proxy_session
+                    .authenticate_publickey(
+                        &proxy.user,
+                        PrivateKeyWithHashAlg::new(
+                            Arc::clone(&key),
+                            proxy_session
+                                .best_supported_rsa_hash()
+                                .await
+                                .wrap_err_with(|| "Failed to get best supported RSA hash")?
+                                .flatten(),
+                        ),
+                    )
+                    .await
+                    .wrap_err_with(|| "SSH authentication failed")?
+                    .success()
+                {
+                    return Err(eyre!("Proxy authentication failed"));
+                }
+                let proxy_session = Arc::new(Mutex::new(proxy_session));
+                sessions.push(proxy_session);
+            }
+        }
     }
-    let proxy_session = Arc::new(Mutex::new(proxy_session));
+    if sessions.is_empty() {
+        return Err(eyre!("No sessions available for proxying"));
+    }
 
     // Serve SOCKS5 server
     let listen_addr = SocketAddr::new(
@@ -130,10 +132,15 @@ async fn main() -> color_eyre::Result<()> {
         .await
         .wrap_err_with(|| "Failed to bind to provided address and port")?;
     info!("Listening on {}", listen_addr);
+    let mut rng = rand::rng();
     loop {
         match listener.accept().await {
             Ok((socket, addr)) => {
-                let session = Arc::clone(&proxy_session);
+                let session = Arc::clone(
+                    &sessions
+                        .choose(&mut rng)
+                        .expect("Proxy sessions shouldn't be empty"),
+                );
                 let fut = async move {
                     let (proto, cmd, target_addr) = Socks5ServerProtocol::accept_no_auth(socket)
                         .await?
@@ -178,19 +185,6 @@ async fn main() -> color_eyre::Result<()> {
 struct SshClient;
 
 impl client::Handler for SshClient {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        _key: &russh::keys::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
-    }
-}
-
-struct ProxyClient;
-
-impl client::Handler for ProxyClient {
     type Error = russh::Error;
 
     async fn check_server_key(
