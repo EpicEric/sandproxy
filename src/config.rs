@@ -21,6 +21,7 @@ pub struct ConfigAccount {
 pub struct ConfigReverseProxy {
     pub host: String,
     pub port: u16,
+    pub server_key_fingerprint: Option<SshKeyFingerprint>,
     pub proxies: Vec<ConfigProxy>,
 }
 
@@ -28,6 +29,18 @@ pub struct ConfigReverseProxy {
 pub struct ConfigProxy {
     pub user: String,
     pub alias: TcpAlias,
+    pub server_key_fingerprint: Option<SshKeyFingerprint>,
+}
+
+#[derive(Debug, DeserializeFromStr)]
+pub struct SshKeyFingerprint(pub russh::keys::ssh_key::Fingerprint);
+
+impl FromStr for SshKeyFingerprint {
+    type Err = russh::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.parse()?))
+    }
 }
 
 #[derive(Debug, DeserializeFromStr)]

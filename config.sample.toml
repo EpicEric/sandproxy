@@ -1,0 +1,13 @@
+address = "::"
+port = 18080
+
+[[accounts]]
+private_key_path = "/data/id_ed25519"
+
+[[accounts.reverse_proxies]]
+host = "sandhole.com.br"
+port = 2222
+server_key_fingerprint = "SHA256:Mjo6yvsG9DzRBiSZ+ce4SL62kGDokwq0/WrsGCLbs7E"
+proxies = [
+  { alias = "my-ssh-host:22", user = "root", server_key_fingerprint = "SHA256:bwf4FDtNeZzFv8xHBzHJwRpDRxssCll8w2tCHFC9n1o" },
+]

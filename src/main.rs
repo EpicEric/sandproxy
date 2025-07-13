@@ -9,9 +9,10 @@ use fast_socks5::server::{Socks5ServerProtocol, transfer};
 use rand::seq::IndexedRandom;
 use russh::client;
 use russh::keys::{key::PrivateKeyWithHashAlg, load_secret_key};
+use sandproxy::SshKeyFingerprint;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -55,7 +56,9 @@ async fn main() -> color_eyre::Result<()> {
 
         // Create Sandhole clients
         for reverse_proxy in account.reverse_proxies {
-            let ssh_client = SshClient;
+            let ssh_client = SshClient {
+                server_key_fingerprint: reverse_proxy.server_key_fingerprint,
+            };
             let mut session = client::connect(
                 Default::default(),
                 (reverse_proxy.host.as_str(), reverse_proxy.port),
@@ -89,7 +92,9 @@ async fn main() -> color_eyre::Result<()> {
                     .await
                     .wrap_err_with(|| "Local forwarding failed")?;
                 let socket = channel.into_stream();
-                let proxy_client = SshClient;
+                let proxy_client = ProxyClient {
+                    server_key_fingerprint: proxy.server_key_fingerprint,
+                };
                 let mut proxy_session =
                     client::connect_stream(Default::default(), socket, proxy_client)
                         .await
@@ -182,15 +187,54 @@ async fn main() -> color_eyre::Result<()> {
     }
 }
 
-struct SshClient;
+struct SshClient {
+    server_key_fingerprint: Option<SshKeyFingerprint>,
+}
 
 impl client::Handler for SshClient {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _key: &russh::keys::PublicKey,
+        key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        Ok(self
+            .server_key_fingerprint
+            .as_ref()
+            .is_none_or(|fingerprint| key.fingerprint(fingerprint.0.algorithm()) == fingerprint.0))
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        debug!(?reason, "SSH client disconnected");
+        Ok(())
+    }
+}
+
+struct ProxyClient {
+    server_key_fingerprint: Option<SshKeyFingerprint>,
+}
+
+impl client::Handler for ProxyClient {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        key: &russh::keys::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(self
+            .server_key_fingerprint
+            .as_ref()
+            .is_none_or(|fingerprint| key.fingerprint(fingerprint.0.algorithm()) == fingerprint.0))
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        debug!(?reason, "SSH proxy client disconnected");
+        Ok(())
     }
 }
