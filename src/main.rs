@@ -1,3 +1,4 @@
+use std::mem;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -8,12 +9,14 @@ use fast_socks5::Socks5Command;
 use fast_socks5::server::{Socks5ServerProtocol, transfer};
 use rand::seq::IndexedRandom;
 use russh::client;
+use russh::keys::PrivateKey;
 use russh::keys::{key::PrivateKeyWithHashAlg, load_secret_key};
 use sandproxy::{ConfigProxy, ConfigReverseProxy};
 use tokio::net::TcpListener;
 use tokio::pin;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -23,6 +26,35 @@ use tracing_subscriber::util::SubscriberInitExt;
 struct Cli {
     #[clap(long, short)]
     pub(crate) config: PathBuf,
+}
+
+struct Handle {
+    i: usize,
+    j: usize,
+    k: usize,
+    handle: Arc<AsyncMutex<client::Handle<ProxyClient>>>,
+}
+
+type SessionsVec = Arc<Mutex<Vec<Handle>>>;
+
+#[derive(Debug, Clone)]
+struct ReverseProxy {
+    i: usize,
+    j: usize,
+    data: ConfigReverseProxy,
+    key: Arc<PrivateKey>,
+    cancellation_token: CancellationToken,
+}
+
+#[derive(Clone)]
+struct Proxy {
+    i: usize,
+    j: usize,
+    k: usize,
+    data: ConfigProxy,
+    key: Arc<PrivateKey>,
+    cancellation_token: CancellationToken,
+    session: Arc<AsyncMutex<client::Handle<SshClient>>>,
 }
 
 #[tokio::main]
@@ -49,8 +81,9 @@ async fn main() -> color_eyre::Result<()> {
         &std::fs::read(cli.config).wrap_err_with(|| "Couldn't find configuration")?,
     )
     .wrap_err_with(|| "Invalid configuration")?;
+    debug!("Loaded config.");
 
-    let sessions = Arc::new(Mutex::new(vec![]));
+    let sessions: SessionsVec = Arc::new(Mutex::new(vec![]));
 
     // Serve SOCKS5 server
     let listen_addr = SocketAddr::new(
@@ -69,11 +102,12 @@ async fn main() -> color_eyre::Result<()> {
             match listener.accept().await {
                 Ok((socket, addr)) => {
                     let session: Arc<AsyncMutex<client::Handle<ProxyClient>>> = Arc::clone(
-                        sessions_clone
+                        &sessions_clone
                             .lock()
                             .unwrap()
                             .choose(&mut rand::rng())
-                            .expect("Proxy sessions shouldn't be empty"),
+                            .expect("Proxy sessions shouldn't be empty")
+                            .handle,
                     );
                     let fut = async move {
                         let (proto, cmd, target_addr) =
@@ -120,17 +154,24 @@ async fn main() -> color_eyre::Result<()> {
 
     let (reverse_proxy_tx, mut reverse_proxy_rx) = mpsc::unbounded_channel();
     let (proxy_tx, mut proxy_rx) = mpsc::unbounded_channel();
-    for account in config.accounts {
+    for (i, account) in config.accounts.iter().enumerate() {
         let key = Arc::new(
             load_secret_key(&account.private_key_path, None)
                 .wrap_err_with(|| "Missing secret key file")?,
         );
 
         // Create Sandhole clients
-        for reverse_proxy in account.reverse_proxies {
+        for (j, reverse_proxy) in account.reverse_proxies.iter().enumerate() {
+            let cancellation_token = CancellationToken::new();
             let ssh_client = SshClient {
                 tx: reverse_proxy_tx.clone(),
-                data: Some(reverse_proxy.clone()),
+                data: Some(ReverseProxy {
+                    i,
+                    j,
+                    data: reverse_proxy.clone(),
+                    key: Arc::clone(&key),
+                    cancellation_token: cancellation_token.clone(),
+                }),
             };
             let mut session = client::connect(
                 Default::default(),
@@ -157,17 +198,28 @@ async fn main() -> color_eyre::Result<()> {
             {
                 return Err(eyre!("Sandhole authentication failed"));
             }
+            let session = Arc::new(AsyncMutex::new(session));
 
             // Create proxy clients
-            for proxy in reverse_proxy.proxies {
+            for (k, proxy) in reverse_proxy.proxies.iter().enumerate() {
                 let channel = session
+                    .lock()
+                    .await
                     .channel_open_direct_tcpip(&proxy.alias.0, proxy.alias.1.into(), "::1", 12345)
                     .await
                     .wrap_err_with(|| "Local forwarding failed")?;
                 let socket = channel.into_stream();
                 let proxy_client = ProxyClient {
                     tx: proxy_tx.clone(),
-                    data: Some(proxy.clone()),
+                    data: Some(Proxy {
+                        i,
+                        j,
+                        k,
+                        data: proxy.clone(),
+                        key: Arc::clone(&key),
+                        cancellation_token: cancellation_token.clone(),
+                        session: Arc::clone(&session),
+                    }),
                 };
                 let mut proxy_session =
                     client::connect_stream(Default::default(), socket, proxy_client)
@@ -192,7 +244,12 @@ async fn main() -> color_eyre::Result<()> {
                     return Err(eyre!("Proxy authentication failed"));
                 }
                 let proxy_session = Arc::new(AsyncMutex::new(proxy_session));
-                sessions.lock().unwrap().push(proxy_session);
+                sessions.lock().unwrap().push(Handle {
+                    i,
+                    j,
+                    k,
+                    handle: proxy_session,
+                });
             }
         }
     }
@@ -211,16 +268,132 @@ async fn main() -> color_eyre::Result<()> {
                 let Some(reverse_proxy) = reverse_proxy else {
                     break Err(eyre!("Channel closed unexpectedly"));
                 };
-                // TODO: Replace reverse proxy and children
+                // Replace reverse proxy and children
+                recreate_reverse_proxy(reverse_proxy, reverse_proxy_tx.clone(), proxy_tx.clone(), &sessions).await?;
             }
             proxy = proxy_rx.recv() => {
                 let Some(proxy) = proxy else {
                     break Err(eyre!("Channel closed unexpectedly"));
                 };
-                // TODO: Replace proxy
+                // Replace proxy
+                recreate_proxy(proxy, proxy_tx.clone(), &sessions).await?;
             }
         }
     }
+}
+
+async fn recreate_reverse_proxy(
+    reverse_proxy: ReverseProxy,
+    tx: UnboundedSender<ReverseProxy>,
+    proxy_tx: UnboundedSender<Proxy>,
+    sessions: &SessionsVec,
+) -> color_eyre::Result<()> {
+    let ssh_client = SshClient {
+        tx,
+        data: Some(reverse_proxy.clone()),
+    };
+    let cancellation_token = reverse_proxy.cancellation_token;
+    let i = reverse_proxy.i;
+    let j = reverse_proxy.j;
+    let mut session = client::connect(
+        Default::default(),
+        (reverse_proxy.data.host.as_str(), reverse_proxy.data.port),
+        ssh_client,
+    )
+    .await
+    .wrap_err_with(|| "Failed to connect to SSH server")?;
+    if !session
+        .authenticate_publickey(
+            "sandproxy",
+            PrivateKeyWithHashAlg::new(
+                Arc::clone(&reverse_proxy.key),
+                session
+                    .best_supported_rsa_hash()
+                    .await
+                    .wrap_err_with(|| "Failed to get best supported RSA hash")?
+                    .flatten(),
+            ),
+        )
+        .await
+        .wrap_err_with(|| "SSH authentication failed")?
+        .success()
+    {
+        return Err(eyre!("Sandhole authentication failed"));
+    }
+    let session = Arc::new(AsyncMutex::new(session));
+
+    // Create proxy clients
+    for (k, proxy) in reverse_proxy.data.proxies.iter().enumerate() {
+        let proxy = Proxy {
+            i,
+            j,
+            k,
+            data: proxy.clone(),
+            key: Arc::clone(&reverse_proxy.key),
+            cancellation_token: cancellation_token.clone(),
+            session: Arc::clone(&session),
+        };
+        recreate_proxy(proxy, proxy_tx.clone(), sessions).await?;
+    }
+    Ok(())
+}
+
+async fn recreate_proxy(
+    proxy: Proxy,
+    tx: UnboundedSender<Proxy>,
+    sessions: &SessionsVec,
+) -> color_eyre::Result<()> {
+    let i = proxy.i;
+    let j = proxy.j;
+    let k = proxy.k;
+    let channel = proxy
+        .session
+        .lock()
+        .await
+        .channel_open_direct_tcpip(&proxy.data.alias.0, proxy.data.alias.1.into(), "::1", 12345)
+        .await
+        .wrap_err_with(|| "Local forwarding failed")?;
+    let socket = channel.into_stream();
+    let proxy_client = ProxyClient {
+        tx: tx.clone(),
+        data: Some(proxy.clone()),
+    };
+    let mut proxy_session = client::connect_stream(Default::default(), socket, proxy_client)
+        .await
+        .wrap_err_with(|| "Failed to connect to proxied SSH server")?;
+    if !proxy_session
+        .authenticate_publickey(
+            &proxy.data.user,
+            PrivateKeyWithHashAlg::new(
+                Arc::clone(&proxy.key),
+                proxy_session
+                    .best_supported_rsa_hash()
+                    .await
+                    .wrap_err_with(|| "Failed to get best supported RSA hash")?
+                    .flatten(),
+            ),
+        )
+        .await
+        .wrap_err_with(|| "SSH authentication failed")?
+        .success()
+    {
+        return Err(eyre!("Proxy authentication failed"));
+    }
+    let proxy_session = Arc::new(AsyncMutex::new(proxy_session));
+    let mut sessions = sessions.lock().unwrap();
+    let index = sessions
+        .binary_search_by_key(&(i, j, k), |handle| (handle.i, handle.j, handle.k))
+        .map_err(|_| eyre!("Proxy not found in list"))?;
+    let _ = mem::replace(
+        &mut sessions[index],
+        Handle {
+            i,
+            j,
+            k,
+            handle: proxy_session,
+        },
+    );
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -254,8 +427,8 @@ async fn wait_for_signal() {
 }
 
 struct SshClient {
-    tx: UnboundedSender<ConfigReverseProxy>,
-    data: Option<ConfigReverseProxy>,
+    tx: UnboundedSender<ReverseProxy>,
+    data: Option<ReverseProxy>,
 }
 
 impl client::Handler for SshClient {
@@ -268,7 +441,7 @@ impl client::Handler for SshClient {
         Ok(self
             .data
             .as_ref()
-            .and_then(|data| data.server_key_fingerprint.as_ref())
+            .and_then(|reverse_proxy| reverse_proxy.data.server_key_fingerprint.as_ref())
             .is_none_or(|fingerprint| key.fingerprint(fingerprint.0.algorithm()) == fingerprint.0))
     }
 
@@ -277,16 +450,22 @@ impl client::Handler for SshClient {
         reason: client::DisconnectReason<Self::Error>,
     ) -> Result<(), Self::Error> {
         debug!(?reason, "SSH client disconnected");
-        if let Some(data) = self.data.take() {
-            self.tx.send(data)?;
-        }
         Ok(())
     }
 }
 
+impl Drop for SshClient {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            data.cancellation_token.cancel();
+            let _ = self.tx.send(data);
+        }
+    }
+}
+
 struct ProxyClient {
-    tx: UnboundedSender<ConfigProxy>,
-    data: Option<ConfigProxy>,
+    tx: UnboundedSender<Proxy>,
+    data: Option<Proxy>,
 }
 
 impl client::Handler for ProxyClient {
@@ -299,7 +478,7 @@ impl client::Handler for ProxyClient {
         Ok(self
             .data
             .as_ref()
-            .and_then(|data| data.server_key_fingerprint.as_ref())
+            .and_then(|proxy| proxy.data.server_key_fingerprint.as_ref())
             .is_none_or(|fingerprint| key.fingerprint(fingerprint.0.algorithm()) == fingerprint.0))
     }
 
@@ -308,9 +487,16 @@ impl client::Handler for ProxyClient {
         reason: client::DisconnectReason<Self::Error>,
     ) -> Result<(), Self::Error> {
         debug!(?reason, "SSH proxy client disconnected");
-        if let Some(data) = self.data.take() {
-            self.tx.send(data)?;
-        }
         Ok(())
+    }
+}
+
+impl Drop for ProxyClient {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            if !data.cancellation_token.is_cancelled() {
+                let _ = self.tx.send(data);
+            }
+        }
     }
 }
