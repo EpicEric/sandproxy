@@ -266,7 +266,7 @@ async fn main() -> color_eyre::Result<()> {
             }
             reverse_proxy = reverse_proxy_rx.recv() => {
                 let Some(reverse_proxy) = reverse_proxy else {
-                    break Err(eyre!("Channel closed unexpectedly"));
+                    break Err(eyre!("Reverse proxy channel closed unexpectedly"));
                 };
                 // Replace reverse proxy and children
                 if let Err(error) = recreate_reverse_proxy(reverse_proxy, reverse_proxy_tx.clone(), proxy_tx.clone(), &sessions).await {
@@ -275,7 +275,7 @@ async fn main() -> color_eyre::Result<()> {
             }
             proxy = proxy_rx.recv() => {
                 let Some(proxy) = proxy else {
-                    break Err(eyre!("Channel closed unexpectedly"));
+                    break Err(eyre!("Proxy channel closed unexpectedly"));
                 };
                 // Replace proxy
                 if let Err(error) = recreate_proxy(proxy, proxy_tx.clone(), &sessions).await {
@@ -350,13 +350,16 @@ async fn recreate_proxy(
     let i = proxy.i;
     let j = proxy.j;
     let k = proxy.k;
-    let channel = proxy
-        .session
-        .lock()
-        .await
+    let ssh_session = proxy.session.lock().await;
+    if ssh_session.is_closed() {
+        debug!("SSH session is not connected, skipping proxy re-creation.");
+        return Ok(());
+    }
+    let channel = ssh_session
         .channel_open_direct_tcpip(&proxy.data.alias.0, proxy.data.alias.1.into(), "::1", 12345)
         .await
         .wrap_err_with(|| "Local forwarding failed")?;
+    drop(ssh_session);
     let socket = channel.into_stream();
     let proxy_client = ProxyClient {
         tx: tx.clone(),
